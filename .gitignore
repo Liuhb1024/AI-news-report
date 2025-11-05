@@ -1,0 +1,42 @@
+# Python cache and virtualenv
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+
+# Logs and debug
+*.log
+scraper_log.txt
+*_debug.html
+
+# Generated artifacts from this project
+xinwenlianbo_*.json
+xinwenlianbo_*.txt
+xinwenlianbo_*.md
+analysis_*.json
+enriched_*.json
+report_*.md
+summary_*.txt
+
+# pytest/coverage (if used later)
+.pytest_cache/
+.coverage*
+coverage.xml
+htmlcov/
