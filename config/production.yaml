@@ -1,0 +1,42 @@
+# 生产环境覆盖
+
+logging:
+  # 落地日志并控制文件大小
+  level: "INFO"
+  console: true
+  file:
+    enabled: true
+    max_bytes: 52428800
+    backup_count: 10
+
+system:
+  # 关闭调试输出
+  debug: false
+  show_progress: false
+
+scraper:
+  # 更保守的抓取间隔
+  delay_between_requests: 2.0
+  max_retry: 3
+
+enrichment:
+  safe_mode: true
+  rate_limit:
+    max_requests_per_domain: 8
+    min_delay: 5
+    max_delay: 10
+
+report:
+  # 启用全部报告格式
+  export_formats:
+    html: true
+    pdf: true
+
+cache:
+  # 提高生产环境响应速度
+  enabled: true
+  ttl:
+    news_data: 86400
+    llm_analysis: 604800
+    enriched_data: 604800
+

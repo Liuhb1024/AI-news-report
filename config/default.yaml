@@ -1,0 +1,91 @@
+# 基础配置：默认环境
+
+llm:
+  # DeepSeek API 基础配置（密钥从环境变量读取）
+  api_key: "${OPENAI_API_KEY}"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  temperature:
+    analysis: 0.3
+    report: 0.4
+  max_tokens:
+    analysis: 4000
+    report: 6000
+  timeout: 60
+
+scraper:
+  # 新闻联播爬虫参数
+  base_url: "https://tv.cctv.com/lm/xwlb/"
+  timeout: 15
+  max_retry: 3
+  delay_between_requests: 1.5
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+
+enrichment:
+  # 补充数据的爬虫策略
+  safe_mode: true
+  rate_limit:
+    max_requests_per_domain: 10
+    min_delay: 5
+    max_delay: 8
+  max_results:
+    news_per_source: 4
+    total_news: 8
+    policies: 5
+
+report:
+  # 报告生成参数
+  directions:
+    min: 3
+    max: 5
+  confidence_threshold: 5
+  opportunities_per_direction: 3
+  export_formats:
+    markdown: true
+    html: true
+    pdf: true
+    summary: true
+  pdf_font_path: "fonts/NotoSansSC-Regular.ttf"
+
+paths:
+  # 输出路径（按日期分组到 outputs/YYYY-MM-DD/）
+  group_by_date: true
+  output_root: "outputs"
+  date_folder_format: "%Y-%m-%d"
+  data_dir: "data"
+  output_dir: "."
+  log_dir: "logs"
+  cache_dir: ""
+  prompts_dir: "prompts"
+
+logging:
+  # 日志格式与落地设置
+  level: "INFO"
+  format: "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+  console: true
+  file:
+    enabled: true
+    filename: "logs/app.log"
+    max_bytes: 10485760
+    backup_count: 5
+
+cache:
+  # 本地缓存设置（可添加）
+  enabled: true
+  directory: "cache"
+  ttl:
+    news_data: 86400
+    llm_analysis: 604800
+    enriched_data: 604800
+
+system:
+  encoding: "utf-8"
+  max_workers: 5
+  show_progress: true
+  debug: false
+

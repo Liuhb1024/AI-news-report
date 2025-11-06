@@ -1,0 +1,37 @@
+# 开发环境专用覆盖
+
+logging:
+  # 日志更详细
+  level: "DEBUG"
+  console: true
+
+system:
+  # 启用调试信息
+  debug: true
+  show_progress: true
+
+scraper:
+  # 加快抓取速度
+  delay_between_requests: 0.5
+
+enrichment:
+  rate_limit:
+    min_delay: 2
+    max_delay: 4
+  max_results:
+    news_per_source: 2
+    total_news: 4
+    policies: 3
+
+llm:
+  # 减少开发时 token 用量
+  max_tokens:
+    analysis: 3000
+    report: 4000
+
+report:
+  # 仅保留必要导出格式
+  export_formats:
+    html: false
+    pdf: false
+
