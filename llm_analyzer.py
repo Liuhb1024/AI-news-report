@@ -4,57 +4,37 @@ LLM分析器模块
 """
 
 import json
-from openai import OpenAI
+import re
 from datetime import datetime
+from typing import Optional
+
 from config import get_config
+from models import ModelRequest, ModelRouter, ModelError
 
 class LLMAnalyzer:
-    """LLM分析器：使用DeepSeek提取投资方向"""
+    """LLM分析器：通过模型路由提取投资方向"""
     
-    def __init__(self, api_key=None, model=None, config=None):
+    def __init__(self, model=None, config=None, model_router: Optional[ModelRouter] = None):
         """
         初始化分析器
         
         参数：
-            api_key: API密钥（可选，默认从配置读取）
-            model: 使用的模型（可选，默认从配置读取）
+            model: 使用的模型代号（可选，默认从配置读取）
             config: 配置对象（可选，默认使用全局配置）
+            model_router: 模型路由器，负责选择具体模型
         """
         # 获取配置
         self.config = config or get_config()
         
-        # 获取API密钥
-        self.api_key = api_key or self.config.get("llm.api_key")
-        
-        if not self.api_key:
-            raise ValueError(
-                "❌ 错误：未找到API密钥！\n"
-                "请确保 .env 文件存在，并包含 OPENAI_API_KEY=你的密钥"
-            )
-        
-        # 获取模型配置
+        if not model_router:
+            raise ValueError("LLMAnalyzer 需要提供 model_router")
+
+        self.model_router = model_router
+        self.model_task = "policy_analysis"
         self.model = model or self.config.get("llm.model", "deepseek-chat")
-        self.base_url = self.config.get("llm.base_url", "https://api.deepseek.com")
-        self.timeout = self.config.get("llm.timeout", 60)
-        
-        # 初始化DeepSeek客户端
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout
-        )
-        
-        print(f"✅ LLM分析器初始化成功")
-        print(f"   模型: {self.model}")
-        print(f"   密钥: {self._mask_api_key()}")
+        print("✅ LLM分析器初始化成功 (使用模型路由)")
     
-    def _mask_api_key(self):
-        """脱敏显示API密钥"""
-        if len(self.api_key) > 12:
-            return f"{self.api_key[:8]}...{self.api_key[-4:]}"
-        return "***"
-    
-    def extract_investment_directions(self, news_data):
+    def extract_investment_directions(self, news_data, use_enhanced=False):
         """
         从新闻数据中提取投资方向
         
@@ -68,12 +48,13 @@ class LLMAnalyzer:
                     },
                     ...
                 ]
+            use_enhanced: 已废弃的参数，保留以兼容旧代码
         
         返回：
             dict: 分析结果，包含投资方向
         """
         print("<br />" + "="*60)
-        print("🤖 开始AI分析...")
+        print("🤖 开始AI深度分析...")
         print("="*60)
         
         # 格式化新闻内容
@@ -84,43 +65,56 @@ class LLMAnalyzer:
         
         # 调用LLM
         try:
-            print("📤 正在发送请求到DeepSeek...")
+            print("📤 正在发送请求到模型服务...")
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是一位资深的政策分析师和投资顾问，擅长从新闻中提取投资机会。"
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=self.config.get("llm.temperature.analysis", 0.3),
-                max_tokens=self.config.get("llm.max_tokens.analysis", 4000)
+            messages = [
+                {
+                    "role": "system",
+                    "content": "你是一位资深的政策分析师和投资顾问，擅长从新闻中提取投资机会。"
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+
+            request = ModelRequest(
+                prompt=prompt,
+                messages=messages,
+                metadata={
+                    "temperature": self.config.get("llm.temperature.analysis", 0.3),
+                    "max_tokens": self.config.get("llm.max_tokens.analysis", 4000),
+                },
             )
-            
+
+            response = self.model_router.generate(self.model_task, request)
+            content = response.content
+            provider = response.provider
+            usage_info = response.usage or {}
             print("📥 收到响应，正在解析...")
-            
-            # 提取返回内容
-            content = response.choices[0].message.content
-            
+
             # 尝试解析JSON
             result = self._parse_response(content)
             
+            # 如果LLM没有生成policy_insights，自动补充
+            if 'policy_insights' not in result:
+                result = self._enhance_with_policy_insights(result)
+            
             # 添加元数据
             result['_metadata'] = {
-                'model': self.model,
+                'model': provider,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') else 0
+                'tokens_used': usage_info.get('total_tokens', 0) if isinstance(usage_info, dict) else usage_info,
             }
             
             print(f"✅ 分析完成！使用了约 {result['_metadata']['tokens_used']} tokens")
             
             return result
             
+        except ModelError as e:
+            print(f"❌ 模型路由调用失败: {e}")
+            return None
+
         except json.JSONDecodeError as e:
             print(f"❌ JSON解析失败: {e}")
             print(f"原始响应: {content[:500]}...")
@@ -133,17 +127,26 @@ class LLMAnalyzer:
     def _format_news(self, news_data):
         """将新闻数据格式化为文本"""
         formatted = []
-        
+
         for news in news_data:
-            # 清理内容中的<br />标签
-            content = news['content'].replace('<br />', '<br />')
-            
+            if not isinstance(news, dict):
+                continue
+
+            index = news.get('index', '')
+            title = news.get('title', '').strip()
+            raw_content = news.get('content', '') or ''
+
+            # 统一清洗 HTML 换行与标签
+            content = re.sub(r'<br\s*/?>', '\n', raw_content, flags=re.IGNORECASE)
+            content = re.sub(r'<[^>]+>', '', content)
+            content = re.sub(r'\s+\n', '\n', content)
+            content = re.sub(r'\n{2,}', '\n', content).strip()
+
             formatted.append(
-                f"【新闻{news['index']}】{news['title']}<br />"
-                f"{content}<br />"
+                f"【新闻{index}】{title}\n{content}\n"
             )
-        
-        return "<br />".join(formatted)
+
+        return "\n".join(formatted)
     
     def _build_prompt(self, news_text):
         """构建提示词"""
@@ -223,6 +226,19 @@ confidence置信度（1-10分）：
   "date": "YYYY-MM-DD 或从标题推断",
   "summary": "50 字内的政策基调概述",
   "key_policies": ["核心政策1", "核心政策2"],
+  
+  "policy_insights": {{
+    "overall_tone": "积极进取/稳中求进/谨慎观望",
+    "key_signals": [
+      {{
+        "topic": "主题（如：海南自贸港）",
+        "strength_score": 9.5,
+        "hidden_message": "政策潜台词和深层含义（50字内）",
+        "urgency_indicator": "时间紧迫性描述"
+      }}
+    ]
+  }},
+  
   "directions": [
     {{
       "name": "方向名（4-12字）",
@@ -271,6 +287,73 @@ confidence置信度（1-10分）：
         # 解析JSON
         result = json.loads(json_str)
         
+        return result
+    
+    def _enhance_with_policy_insights(self, result):
+        """为分析结果自动生成政策玄机解读"""
+        directions = result.get('directions', [])
+        
+        if not directions:
+            return result
+        
+        # 生成key_signals
+        key_signals = []
+        for direction in directions[:3]:  # 取前3个最重要的方向
+            confidence = direction.get('confidence', 5)
+            urgency = direction.get('urgency', '中')
+            policy_strength = direction.get('policy_strength', '中')
+            
+            # 根据置信度和紧迫性生成潜台词
+            if confidence >= 9 and urgency == '高':
+                message = "政策进入冲刺期，配套措施将密集出台，建议立即布局"
+            elif confidence >= 8 and urgency == '高':
+                message = "政策方向明确且紧迫，市场机会窗口已打开，适合积极跟进"
+            elif confidence >= 8:
+                message = "政策方向明确，建议提前准备，等待配套细则"
+            elif confidence >= 7:
+                message = "政策信号清晰，可稳步推进，持续关注"
+            else:
+                message = "政策处于培育期，建议持续观察"
+            
+            # 生成紧迫性指标
+            urgency_map = {
+                '高': '明确时间节点或短期窗口期',
+                '中': '中期规划，需在半年内布局',
+                '低': '长期趋势，可从容准备'
+            }
+            urgency_indicator = urgency_map.get(urgency, '观察期')
+            
+            # 计算强度分数
+            strength_score = confidence * 0.8
+            if policy_strength == '高':
+                strength_score = min(10, strength_score + 1.5)
+            elif policy_strength == '低':
+                strength_score = max(1, strength_score - 1.5)
+            
+            signal = {
+                'topic': direction.get('name', '未知'),
+                'strength_score': round(strength_score, 1),
+                'hidden_message': message,
+                'urgency_indicator': urgency_indicator
+            }
+            key_signals.append(signal)
+        
+        # 判断整体基调
+        avg_confidence = sum(d.get('confidence', 0) for d in directions) / len(directions)
+        if avg_confidence >= 8:
+            overall_tone = '积极进取'
+        elif avg_confidence >= 6:
+            overall_tone = '稳中求进'
+        else:
+            overall_tone = '谨慎观望'
+        
+        # 添加policy_insights
+        result['policy_insights'] = {
+            'overall_tone': overall_tone,
+            'key_signals': key_signals
+        }
+        
+        print("   💡 已自动生成政策玄机解读")
         return result
     
     def save_analysis(self, result, date_str):

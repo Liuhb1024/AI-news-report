@@ -40,3 +40,6 @@ data/
 .pytest_cache/
 .coverage*
 htmlcov/
+test_*_output/
+test_*.py
+quick_test_*.py

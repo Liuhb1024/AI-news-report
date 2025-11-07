@@ -6,3 +6,11 @@ Markdown>=3.6
 weasyprint>=62.3
 xhtml2pdf>=0.2.14
 PyYAML>=6.0.1
+
+# 图表生成（支持两种方案）
+matplotlib>=3.7.0
+numpy>=1.24.0
+pyecharts>=2.0.0
+snapshot-selenium>=0.0.4
+selenium>=4.0.0
+webdriver-manager>=4.0.0

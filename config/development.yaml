@@ -30,8 +30,8 @@ llm:
     report: 4000
 
 report:
-  # 仅保留必要导出格式
+  # 开发环境也启用所有导出格式
   export_formats:
-    html: false
-    pdf: false
+    html: true
+    pdf: true
 

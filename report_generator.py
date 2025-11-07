@@ -1,788 +1,1451 @@
 """
 报告生成模块
-基于补充数据生成深度投资分析报告
+基于补充后的数据生成投资分析报告
 """
 
-import json
 import os
-from openai import OpenAI
+import json
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
 from config import get_config
-try:
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-except Exception:
-    pdfmetrics = None
-    TTFont = None
+from models import ModelRequest, ModelRouter
+from utils.path_helper import get_output_paths
+from visualization_generator import VisualizationGenerator
 
-# Optional dependencies for PDF export
-try:
-    import markdown as md  # Markdown -> HTML
-except Exception:
-    md = None
-
-# Prefer pure-Python xhtml2pdf first (no system libs)
-PISA_IMPORT_ERR = None
-try:
-    from xhtml2pdf import pisa  # HTML -> PDF (pure Python)
-except Exception as _e:
-    pisa = None
-    PISA_IMPORT_ERR = str(_e)
-
-# Optional WeasyPrint (needs system libs on Windows)
-WEASY_IMPORT_ERR = None
-try:
-    from weasyprint import HTML as WEASY_HTML  # HTML -> PDF
-except Exception as _e:
-    WEASY_HTML = None
-    WEASY_IMPORT_ERR = str(_e)
 
 class ReportGenerator:
-    """投资分析报告生成器"""
+    """投资报告生成器"""
     
-    def __init__(self, api_key=None, model=None, config=None):
+    def __init__(self, config=None, model_router: Optional[ModelRouter] = None):
         """
         初始化报告生成器
         
         参数：
-            api_key: API密钥（可选，默认从配置读取）
-            model: 使用的模型（可选，默认从配置读取）
-            config: 配置对象（可选，默认使用全局配置）
+            config: 配置对象（可选）
+            model_router: 模型路由器（可选，用于深度分析）
         """
-        # 获取配置
         self.config = config or get_config()
-        
-        # 获取API密钥和模型配置
-        self.api_key = api_key or self.config.get("llm.api_key")
-        
-        if not self.api_key:
-            raise ValueError("❌ 未找到API密钥！")
-        
-        self.model = model or self.config.get("llm.model", "deepseek-chat")
-        self.base_url = self.config.get("llm.base_url", "https://api.deepseek.com")
-        self.timeout = self.config.get("llm.timeout", 60)
-        
-        # 初始化DeepSeek客户端
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout
-        )
-        
-        print(f"✅ 报告生成器初始化成功")
-        print(f"   模型: {self.model}")
+        self.model_router = model_router
+        self.model_task = "report_generation"
+        self.viz_generator = None  # 延迟初始化
     
+    def _get_confidence(self, direction):
+        """
+        获取置信度/确定性评分（兼容新旧格式）
+        
+        新格式：direction['quantitative_scores']['certainty']
+        旧格式：direction['confidence']
+        """
+        # 优先使用新格式
+        if 'quantitative_scores' in direction:
+            return direction['quantitative_scores'].get('certainty', 5)
+        # 降级到旧格式
+        return direction.get('confidence', 5)
+        
     def generate_full_report(self, enriched_data, date_str):
         """
         生成完整的投资分析报告
         
         参数：
-            enriched_data: 补充后的完整数据
-            date_str: 日期字符串
+            enriched_data: 补充后的数据
+            date_str: 日期字符串 YYYYMMDD
         
         返回：
-            str: Markdown格式的报告
+            str: Markdown格式的报告内容
         """
         print("\n" + "="*60)
         print("📝 开始生成投资分析报告...")
         print("="*60)
         
-        # 获取投资方向
-        directions = enriched_data.get('directions', [])
+        # 初始化可视化生成器
+        paths = get_output_paths(self.config, date_str)
+        charts_dir = os.path.join(paths['reports_dir'], 'charts')
+        self.viz_generator = VisualizationGenerator(output_dir=charts_dir)
+        self.reports_dir = paths['reports_dir']  # 保存reports目录路径，用于计算相对路径
+        print("📊 可视化生成器已初始化")
         
-        if not directions:
-            print("❌ 没有投资方向，无法生成报告")
-            return None
+        # 解析日期
+        try:
+            date_obj = datetime.strptime(date_str, "%Y%m%d")
+            formatted_date = date_obj.strftime("%Y年%m月%d日")
+        except:
+            formatted_date = date_str
         
-        # 生成报告各部分
-        report_parts = []
+        # 构建报告
+        sections = []
         
-        # 1. 报告头部
-        print("\n📋 生成报告头部...")
-        header = self._generate_header(enriched_data, date_str)
-        report_parts.append(header)
+        # 1. 标题和概述
+        sections.append(self._generate_header(enriched_data, formatted_date))
         
         # 2. 执行摘要
-        print("📊 生成执行摘要...")
-        summary = self._generate_executive_summary(enriched_data)
-        report_parts.append(summary)
+        sections.append(self._generate_executive_summary(enriched_data))
         
-        # 3. 为每个方向生成深度分析
-        for i, direction in enumerate(directions, 1):
-            print(f"\n🔍 分析方向 {i}/{len(directions)}: {direction['name']}...")
-            
-            direction_report = self._generate_direction_analysis(
-                direction, 
-                enriched_data,
-                i
-            )
-            report_parts.append(direction_report)
+        # 2.5. 政策玄机解读（如果有）
+        if 'policy_insights' in enriched_data:
+            sections.append(self._generate_policy_insights(enriched_data))
         
-        # 4. 报告尾部
-        print("\n📌 生成总结与建议...")
-        footer = self._generate_footer(enriched_data)
-        report_parts.append(footer)
+        # 3. 政策基调分析
+        sections.append(self._generate_policy_overview(enriched_data))
         
-        # 组合完整报告
-        full_report = "\n\n".join(report_parts)
+        # 4. 投资方向详细分析
+        sections.append(self._generate_directions_analysis(enriched_data, date_str))
         
-        print("\n✅ 报告生成完成！")
+        # 5. 风险提示
+        sections.append(self._generate_risk_disclaimer())
         
-        return full_report
+        # 6. 附录
+        sections.append(self._generate_appendix(enriched_data))
+        
+        report = "\n\n".join(sections)
+        
+        print("✅ 报告生成完成")
+        return report
     
-    def _generate_header(self, data, date_str):
-        """生成报告头部"""
-        # 格式化日期
-        year = date_str[:4]
-        month = date_str[4:6]
-        day = date_str[6:8]
-        date_formatted = f"{year}年{month}月{day}日"
-        
-        summary = data.get('summary', '政策信号分析')
-        key_policies = data.get('key_policies', [])
+    def _generate_header(self, data, formatted_date):
+        """生成报告标题"""
+        summary = data.get('summary', '政策导向投资机会分析')
         
         header = f"""# 投资机会分析报告
 
-**报告日期**: {date_formatted}  
-**数据来源**: 新闻联播 + 权威媒体补充  
-**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**日期**: {formatted_date}  
+**主题**: {summary}  
+**生成时间**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
----
-
-## 📌 政策基调
-
-> {summary}
-
-"""
-        
-        if key_policies:
-            header += "\n**核心政策关键词**：\n"
-            for i, policy in enumerate(key_policies[:5], 1):
-                header += f"{i}. {policy}  \n"
-        
-        header += "\n---\n"
-        
+---"""
         return header
     
     def _generate_executive_summary(self, data):
         """生成执行摘要"""
         directions = data.get('directions', [])
+        metadata = data.get('_enrichment_metadata', {})
         
-        summary = f"""## 🎯 执行摘要
+        if not directions:
+            return """## 📋 执行摘要
 
-本报告基于 **{len(directions)}** 个识别出的投资方向进行深度分析：
+**当日未识别出明确的投资机会。**
+
+基于当日新闻联播内容分析，未发现符合以下标准的投资方向：
+- 政策支持明确
+- 资金门槛适中（≤500万）
+- 具有可落地性
+
+建议继续关注后续政策动态。"""
+        
+        # 统计信息
+        high_confidence = [d for d in directions if self._get_confidence(d) >= 8]
+        urgent = [d for d in directions if d.get('urgency') == '高']
+        
+        summary = f"""## 📋 执行摘要
+
+**核心发现**：
+
+- 📊 **投资方向数量**: {len(directions)} 个
+- ⭐ **高置信度方向**: {len(high_confidence)} 个（置信度≥8）
+- 🔥 **高紧迫性方向**: {len(urgent)} 个
+- 📰 **权威资讯**: {metadata.get('total_requests', 0)} 条
+- 🛡️  **数据来源**: {', '.join(metadata.get('sources_used', []))}
+
+**重点关注方向**：
 
 """
         
-        for i, direction in enumerate(directions, 1):
-            confidence = direction.get('confidence', 0)
-            urgency = direction.get('urgency', '未知')
-            category = direction.get('category', '未知')
-            threshold = direction.get('investment_threshold', '未知')
-            
-            # 置信度星级
-            stars = '⭐' * min(confidence, 10)
-            
-            summary += f"{i}. **{direction['name']}** {'⭐' * min(int(confidence) if isinstance(confidence, (int, float)) else 0, 10)}\n"
-            summary += f"   - 置信度: {confidence}/10 | 紧迫性: {urgency} | 类别: {category} | 门槛: {threshold}\n\n"
+        # 列出高置信度方向
+        for i, direction in enumerate(high_confidence[:3], 1):
+            summary += f"{i}. **{direction['name']}** "
+            summary += f"（置信度: {self._get_confidence(direction)}/10, "
+            summary += f"类别: {direction.get('category', '未分类')}）\n"
         
-        summary += "---\n"
+        if not high_confidence:
+            # 如果没有高置信度的，列出置信度最高的3个
+            sorted_dirs = sorted(directions, key=lambda x: self._get_confidence(x), reverse=True)
+            for i, direction in enumerate(sorted_dirs[:3], 1):
+                summary += f"{i}. **{direction['name']}** "
+                summary += f"（置信度: {self._get_confidence(direction)}/10, "
+                summary += f"类别: {direction.get('category', '未分类')}）\n"
         
         return summary
     
-    def _generate_direction_analysis(self, direction, full_data, index):
-        """
-        为单个投资方向生成深度分析
-        这是报告的核心部分
-        """
-        # 准备提示词数据
-        analysis_input = self._prepare_analysis_input(direction)
+    def _generate_policy_insights(self, data):
+        """生成政策玄机深度解读"""
+        policy_insights = data.get('policy_insights', {})
+        key_signals = policy_insights.get('key_signals', [])
+        overall_tone = policy_insights.get('overall_tone', '稳健')
         
-        # 构建提示词
-        prompt = self._build_deep_analysis_prompt(analysis_input, index)
+        section = f"""## 🔍 政策玄机深度解读
+
+**整体政策基调**: {overall_tone}
+
+"""
         
-        # 调用LLM
-        try:
-            print(f"   📤 发送请求到DeepSeek...")
+        if key_signals:
+            # 生成政策强度对比图
+            if self.viz_generator and len(key_signals) > 0:
+                try:
+                    chart_path = self.viz_generator.generate_policy_strength_chart(
+                        key_signals, 
+                        'policy_strength.png'
+                    )
+                    # 转换为相对于报告文件的相对路径
+                    chart_rel_path = os.path.relpath(chart_path, self.reports_dir).replace('\\', '/')
+                    section += f"\n![政策信号强度对比]({chart_rel_path})\n\n"
+                    print(f"   ✅ 生成政策强度图: {chart_path}")
+                except Exception as e:
+                    print(f"   ⚠️  政策强度图生成失败: {e}")
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是一位资深的产业投资分析师，拥有10年以上的投资研究经验，擅长从政策、市场、竞争等多维度分析投资机会。你的分析报告以数据驱动、逻辑清晰、可执行性强著称。"
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
+            section += "**本期重大政策信号**：\n\n"
+            for i, signal in enumerate(key_signals, 1):
+                topic = signal.get('topic', '未知')
+                strength = signal.get('strength_score', 5)
+                message = signal.get('hidden_message', '')
+                urgency = signal.get('urgency_indicator', '')
+                
+                # 强度emoji
+                strength_emoji = "🔴" if strength >= 9 else "🟠" if strength >= 7 else "🟡"
+                
+                section += f"{i}. {strength_emoji} **{topic}**（强度: {strength}/10）\n"
+                section += f"   - **潜台词解读**: {message}\n"
+                section += f"   - **紧迫性**: {urgency}\n\n"
+        
+        return section
+    
+    def _generate_policy_overview(self, data):
+        """生成政策概述"""
+        key_policies = data.get('key_policies', [])
+        summary = data.get('summary', '')
+        
+        section = f"""## 🎯 政策基调分析
+
+**今日政策导向**: {summary}
+
+"""
+        
+        if key_policies:
+            section += "**核心政策要点**：\n\n"
+            for i, policy in enumerate(key_policies, 1):
+                section += f"{i}. {policy}\n"
+        else:
+            section += "*本日未提取到明确的核心政策。*\n"
+        
+        return section
+    
+    def _generate_directions_analysis(self, data, date_str):
+        """生成投资方向详细分析"""
+        directions = data.get('directions', [])
+        
+        if not directions:
+            return """## 💡 投资方向分析
+
+*当日未识别出具体投资方向。*"""
+        
+        section = f"""## 💡 投资方向分析
+
+共识别 **{len(directions)}** 个投资方向，详细分析如下：
+
+"""
+        
+        # 生成投资方向对比气泡图
+        if self.viz_generator and len(directions) >= 2:
+            try:
+                chart_path = self.viz_generator.generate_investment_comparison(
+                    directions,
+                    'investment_comparison.png'
+                )
+                chart_rel_path = os.path.relpath(chart_path, self.reports_dir).replace('\\', '/')
+                section += f"\n![投资方向对比分析]({chart_rel_path})\n\n"
+                section += "*图：气泡大小表示紧迫性，横轴表示确定性，纵轴表示低风险程度*\n\n"
+                print(f"   ✅ 生成投资方向对比图: {chart_path}")
+            except Exception as e:
+                print(f"   ⚠️  投资对比图生成失败: {e}")
+        
+        section += "\n---\n\n"
+        
+        # 按置信度排序
+        sorted_directions = sorted(directions, key=lambda x: self._get_confidence(x), reverse=True)
+        
+        for i, direction in enumerate(sorted_directions, 1):
+            section += self._generate_single_direction(direction, i, date_str)
+            section += "\n---\n\n"
+        
+        return section
+    
+    def _generate_single_direction(self, direction, index, date_str):
+        """生成单个投资方向的分析"""
+        name = direction.get('name', '未命名')
+        confidence = self._get_confidence(direction)
+        category = direction.get('category', '未分类')
+        keywords = direction.get('keywords', [])
+        policy_signal = direction.get('policy_signal', '无')
+        policy_strength = direction.get('policy_strength', '未知')
+        urgency = direction.get('urgency', '未知')
+        threshold = direction.get('investment_threshold', '未知')
+        reason = direction.get('reason', '无详细说明')
+        recent_news = direction.get('recent_news', [])
+        related_policies = direction.get('related_policies', [])
+        
+        # 置信度emoji
+        confidence_emoji = "🔥" if confidence >= 9 else "⭐" if confidence >= 7 else "💡"
+        
+        # 紧迫性emoji
+        urgency_emoji = "🔴" if urgency == "高" else "🟡" if urgency == "中" else "🟢"
+        
+        analysis = f"""### {index}. {confidence_emoji} {name}
+
+**基本信息**：
+
+| 项目 | 内容 |
+|------|------|
+| 置信度 | {confidence}/10 {self._get_confidence_desc(confidence)} |
+| 行业类别 | {category} |
+| 政策强度 | {policy_strength} |
+| 紧迫性 | {urgency_emoji} {urgency} |
+| 投资门槛 | {threshold} |
+| 关键词 | {', '.join(keywords[:5])} |
+
+**政策依据**：
+
+> {policy_signal}
+
+**投资机会分析**：
+
+{reason}
+
+"""
+        
+        # 量化评分（如果有）
+        if 'quantitative_scores' in direction:
+            analysis += self._format_quantitative_scores(direction['quantitative_scores'])
+            
+            # 生成雷达图
+            if self.viz_generator:
+                try:
+                    scores = direction['quantitative_scores']
+                    radar_data = {
+                        '确定性': scores.get('certainty', 5),
+                        '回报潜力': min(scores.get('return_rate_3y', {}).get('neutral', 20) / 4, 10),  # 归一化到10分制
+                        '风险等级': 10 - scores.get('risk_level', 5),  # 反转，使得低风险得分高
+                        '紧迫性': scores.get('urgency', 5),
+                        '进入门槛': 10 - scores.get('entry_barrier', 5)  # 反转，使得低门槛得分高
                     }
-                ],
-                temperature=self.config.get("llm.temperature.report", 0.4),
-                max_tokens=self.config.get("llm.max_tokens.report", 6000)
+                    
+                    # 使用纯数字命名避免中文乱码问题
+                    chart_filename = f"radar_{index}.png"
+                    chart_path = self.viz_generator.generate_radar_chart(
+                        radar_data,
+                        f"{name} - 多维度评估",
+                        chart_filename
+                    )
+                    chart_rel_path = os.path.relpath(chart_path, self.reports_dir).replace('\\', '/')
+                    analysis += f"\n![{name}多维度评估]({chart_rel_path})\n\n"
+                    print(f"   ✅ 生成雷达图 {index}: {name}")
+                except Exception as e:
+                    print(f"   ⚠️  雷达图生成失败 ({name}): {e}")
+        
+        # 市场分析（如果有）
+        if 'market_analysis' in direction:
+            analysis += self._format_market_analysis(direction['market_analysis'])
+            
+            # 生成市场预测图
+            if self.viz_generator:
+                try:
+                    market = direction['market_analysis']
+                    cagr = market.get('cagr_3y', 0)
+                    
+                    # 简单估算未来三年市场规模（基于CAGR）
+                    tam_str = market.get('tam_estimate', '0')
+                    sam_str = market.get('sam_estimate', '0')
+                    
+                    # 提取数字（假设格式如"100亿元"）
+                    import re
+                    tam_base = float(re.findall(r'[\d.]+', tam_str)[0]) if re.findall(r'[\d.]+', tam_str) else 100
+                    sam_base = float(re.findall(r'[\d.]+', sam_str)[0]) if re.findall(r'[\d.]+', sam_str) else 30
+                    
+                    from datetime import datetime
+                    current_year = datetime.now().year
+                    years = [str(current_year + i) for i in range(3)]
+                    
+                    growth_factor = [1, 1 + cagr/100, (1 + cagr/100)**2]
+                    tam_values = [tam_base * g for g in growth_factor]
+                    sam_values = [sam_base * g for g in growth_factor]
+                    
+                    # 使用纯数字命名避免中文乱码问题
+                    chart_filename = f"market_{index}.png"
+                    chart_path = self.viz_generator.generate_market_forecast_chart(
+                        years,
+                        tam_values,
+                        sam_values,
+                        f"{name} - 市场规模预测",
+                        chart_filename
+                    )
+                    chart_rel_path = os.path.relpath(chart_path, self.reports_dir).replace('\\', '/')
+                    analysis += f"\n![{name}市场规模预测]({chart_rel_path})\n\n"
+                    print(f"   ✅ 生成市场预测图 {index}: {name}")
+                except Exception as e:
+                    print(f"   ⚠️  市场预测图生成失败 ({name}): {e}")
+        
+        # 投资方案（如果有）
+        if 'investment_plans' in direction:
+            analysis += self._format_investment_plans(direction['investment_plans'])
+        
+        # 风险矩阵（如果有）
+        if 'risk_matrix' in direction:
+            analysis += self._format_risk_matrix(direction['risk_matrix'])
+            
+            # 生成风险矩阵图
+            if self.viz_generator:
+                try:
+                    risk_matrix = direction['risk_matrix']
+                    # 转换为可视化格式
+                    risk_viz_data = {}
+                    risk_type_names = {
+                        'policy_risk': '政策风险',
+                        'competition_risk': '竞争风险',
+                        'operation_risk': '运营风险',
+                        'compliance_risk': '合规风险'
+                    }
+                    
+                    for key, name in risk_type_names.items():
+                        if key in risk_matrix:
+                            risk_item = risk_matrix[key]
+                            level = risk_item.get('level', '中')
+                            risk_viz_data[name] = {
+                                'level': level,
+                                'score': self._level_to_risk_score(level)
+                            }
+                    
+                    if risk_viz_data:
+                        # 使用纯数字命名避免中文乱码问题
+                        chart_filename = f"risk_{index}.png"
+                        chart_path = self.viz_generator.generate_risk_matrix(
+                            risk_viz_data,
+                            chart_filename
+                        )
+                        chart_rel_path = os.path.relpath(chart_path, self.reports_dir).replace('\\', '/')
+                        analysis += f"\n![{name}风险评估矩阵]({chart_rel_path})\n\n"
+                        print(f"   ✅ 生成风险矩阵图 {index}: {name}")
+                except Exception as e:
+                    print(f"   ⚠️  风险矩阵图生成失败 ({name}): {e}")
+        
+        # 深度分析（使用LLM）
+        if self.model_router and confidence >= 7:
+            deep_analysis = self._generate_deep_analysis(direction, recent_news, related_policies)
+            if deep_analysis:
+                analysis += f"""**深度洞察**：
+
+{deep_analysis}
+
+"""
+        
+        # 权威资讯
+        if recent_news:
+            analysis += f"""**权威资讯** ({len(recent_news)} 条)：
+
+"""
+            for i, news in enumerate(recent_news[:5], 1):
+                title = news.get('title', '无标题')
+                source = news.get('source', '未知来源')
+                link = news.get('link', '#')
+                pub_time = news.get('pub_time', '')
+                
+                analysis += f"{i}. **{title}**\n"
+                analysis += f"   - 来源: {source}\n"
+                if pub_time:
+                    analysis += f"   - 时间: {pub_time}\n"
+                analysis += f"   - 链接: [{link}]({link})\n\n"
+        
+        # 相关政策
+        if related_policies:
+            analysis += f"""**相关政策文件** ({len(related_policies)} 条)：
+
+"""
+            for i, policy in enumerate(related_policies[:5], 1):
+                title = policy.get('title', '无标题')
+                department = policy.get('department', '')
+                link = policy.get('link', '#')
+                pub_time = policy.get('pub_time', '')
+                
+                analysis += f"{i}. **{title}**\n"
+                if department:
+                    analysis += f"   - 发文单位: {department}\n"
+                if pub_time:
+                    analysis += f"   - 发布时间: {pub_time}\n"
+                analysis += f"   - 链接: [{link}]({link})\n\n"
+        
+        # 行动建议
+        analysis += self._generate_action_suggestions(direction)
+        
+        return analysis
+    
+    def _get_confidence_desc(self, confidence):
+        """获取置信度描述"""
+        if confidence >= 9:
+            return "（极高 - 政策明确，建议重点关注）"
+        elif confidence >= 7:
+            return "（高 - 方向清晰，可积极布局）"
+        elif confidence >= 5:
+            return "（中 - 概念性机会，需谨慎评估）"
+        else:
+            return "（低 - 不建议投入）"
+    
+    def _format_quantitative_scores(self, scores):
+        """格式化量化评分"""
+        certainty = scores.get('certainty', 0)
+        return_rate = scores.get('return_rate_3y', {})
+        risk = scores.get('risk_level', 0)
+        urgency = scores.get('urgency', 0)
+        barrier = scores.get('entry_barrier', 0)
+        
+        section = f"""**📊 量化评估**：
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| 确定性 | {certainty}/10 | {'极高' if certainty >= 9 else '高' if certainty >= 7 else '中' if certainty >= 5 else '低'} |
+| 预期回报率（3年） | 保守{return_rate.get('conservative', 0)}% / 中性{return_rate.get('neutral', 0)}% / 乐观{return_rate.get('optimistic', 0)}% | 基于政策强度预测 |
+| 风险等级 | {risk}/10 | {'高风险' if risk >= 7 else '中等风险' if risk >= 4 else '低风险'} |
+| 紧迫性 | {urgency}/10 | {'立即行动' if urgency >= 8 else '3个月内' if urgency >= 5 else '长期关注'} |
+| 进入门槛 | {barrier}/10 | {'高门槛' if barrier >= 7 else '中等门槛' if barrier >= 4 else '低门槛'} |
+
+"""
+        return section
+    
+    def _format_market_analysis(self, market):
+        """格式化市场分析"""
+        tam = market.get('tam_estimate', '未知')
+        sam = market.get('sam_estimate', '未知')
+        cagr = market.get('cagr_3y', 0)
+        rationale = market.get('rationale', '')
+        
+        section = f"""**📈 市场容量分析**：
+
+- **总市场规模（TAM）**: {tam}
+- **目标市场（SAM）**: {sam}（中小企业可切入）
+- **3年复合增长率（CAGR）**: {cagr}%
+- **估算依据**: {rationale}
+
+"""
+        return section
+    
+    def _format_investment_plans(self, plans):
+        """格式化投资方案"""
+        section = """**💰 分级投资方案**：
+
+"""
+        
+        for plan in plans:
+            scale = plan.get('scale', '')
+            scale_name = {'small': '小微方案', 'medium': '中型方案', 'large': '规模方案'}.get(scale, scale)
+            budget = plan.get('budget_range', '')
+            entry = plan.get('entry_point', '')
+            timeline = plan.get('timeline', '')
+            roi = plan.get('roi_expected', '')
+            steps = plan.get('action_steps', [])
+            
+            section += f"""#### {scale_name}（{budget}）
+
+- **切入点**: {entry}
+- **时间周期**: {timeline}
+- **预期ROI**: {roi}
+
+**行动步骤**：
+"""
+            for step in steps:
+                section += f"- {step}\n"
+            section += "\n"
+        
+        return section
+    
+    def _format_risk_matrix(self, risk_matrix):
+        """格式化风险矩阵"""
+        section = """**⚠️ 风险评估矩阵**：
+
+| 风险类型 | 等级 | 说明 |
+|---------|------|------|
+"""
+        
+        risk_types = {
+            'policy_risk': '政策风险',
+            'competition_risk': '竞争风险',
+            'operation_risk': '运营风险',
+            'compliance_risk': '合规风险'
+        }
+        
+        for key, name in risk_types.items():
+            if key in risk_matrix:
+                risk_data = risk_matrix[key]
+                level = risk_data.get('level', '未知')
+                desc = risk_data.get('desc', '')
+                
+                # 等级emoji
+                level_emoji = '🔴' if level == '极高' or level == '高' else '🟡' if level == '中' else '🟢'
+                
+                section += f"| {name} | {level_emoji} {level} | {desc} |\n"
+        
+        section += "\n"
+        return section
+    
+    def _generate_deep_analysis(self, direction, news_list, policy_list):
+        """
+        使用LLM生成深度分析
+        
+        参数：
+            direction: 投资方向数据
+            news_list: 相关新闻列表
+            policy_list: 相关政策列表
+        """
+        if not self.model_router:
+            return None
+        
+        try:
+            # 构建分析提示词
+            prompt = self._build_deep_analysis_prompt(direction, news_list, policy_list)
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": "你是一位资深的投资分析师，擅长结合政策和市场动态进行深度分析。"
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+            
+            request = ModelRequest(
+                prompt=prompt,
+                messages=messages,
+                metadata={
+                    "temperature": self.config.get("llm.temperature.report", 0.4),
+                    "max_tokens": 800,
+                },
             )
             
-            analysis = response.choices[0].message.content
-            
-            tokens_used = response.usage.total_tokens if hasattr(response, 'usage') else 0
-            print(f"   ✅ 分析完成（使用 ~{tokens_used} tokens）")
-            
-            return analysis
+            response = self.model_router.generate(self.model_task, request)
+            return response.content.strip()
             
         except Exception as e:
-            print(f"   ❌ 分析失败: {e}")
-            return self._generate_fallback_analysis(direction, index)
+            print(f"   ⚠️  深度分析生成失败: {e}")
+            return None
     
-    def _prepare_analysis_input(self, direction):
-        """准备分析输入数据"""
-        return {
-            'name': direction.get('name', ''),
-            'confidence': direction.get('confidence', 0),
-            'category': direction.get('category', ''),
-            'keywords': direction.get('keywords', []),
-            'policy_signal': direction.get('policy_signal', ''),
-            'policy_strength': direction.get('policy_strength', ''),
-            'urgency': direction.get('urgency', ''),
-            'investment_threshold': direction.get('investment_threshold', ''),
-            'reason': direction.get('reason', ''),
-            'search_queries': direction.get('search_queries', []),
-            'recent_news': direction.get('recent_news', []),
-            'related_policies': direction.get('related_policies', []),
-            'keyword_analysis': direction.get('keyword_analysis', {})
-        }
-    
-    def _build_deep_analysis_prompt(self, data, index):
+    def _build_deep_analysis_prompt(self, direction, news_list, policy_list):
         """构建深度分析提示词"""
+        name = direction.get('name', '')
+        reason = direction.get('reason', '')
         
-        # 格式化新闻
-        news_text = self._format_news_for_prompt(data['recent_news'])
+        # 构建新闻摘要
+        news_summary = ""
+        if news_list:
+            news_summary = "\n相关新闻：\n"
+            for i, news in enumerate(news_list[:3], 1):
+                news_summary += f"{i}. {news.get('title', '')} ({news.get('source', '')})\n"
+                snippet = news.get('snippet', '')
+                if snippet:
+                    news_summary += f"   摘要：{snippet[:100]}...\n"
         
-        # 格式化政策
-        policy_text = self._format_policies_for_prompt(data['related_policies'])
+        # 构建政策摘要
+        policy_summary = ""
+        if policy_list:
+            policy_summary = "\n相关政策：\n"
+            for i, policy in enumerate(policy_list[:3], 1):
+                policy_summary += f"{i}. {policy.get('title', '')} ({policy.get('department', '')})\n"
         
-        prompt = f"""请为以下投资方向生成一份专业、深入、可执行的投资分析报告。
+        prompt = f"""请对以下投资方向进行深度分析（150字以内）：
 
-## 投资方向：{data['name']}
+投资方向：{name}
 
-### 基础信息
-- **置信度**: {data['confidence']}/10
-- **行业分类**: {data['category']}
-- **政策信号**: {data['policy_signal']}
-- **政策强度**: {data['policy_strength']}
-- **紧迫性**: {data['urgency']}
-- **投资门槛**: {data['investment_threshold']}
-- **关键词**: {', '.join(data['keywords'])}
+基础分析：{reason}
+{news_summary}
+{policy_summary}
 
-### AI初步判断理由
-{data['reason']}
+请从以下角度简要分析：
+1. 市场机会大小与可行性
+2. 具体的落地方式或切入点
+3. 需要注意的关键要素
 
-### 最新资讯（权威来源）
-{news_text}
-
-### 相关政策文件
-{policy_text}
-
----
-
-## 📋 报告要求
-
-请严格按照以下结构生成分析报告（Markdown格式）：
-
-## 方向{index}：{data['name']}
-
-### 一、机会判断 ⭐
-
-**一句话结论**：（50字内，直接说这个方向值不值得关注，态度要明确）
-
-**核心逻辑**：（200-300字）
-1. **政策逻辑**：政府为什么支持这个方向？背后的战略考量是什么？
-2. **市场逻辑**：当前市场处于什么阶段（萌芽/成长/成熟）？供需关系如何？
-3. **时间窗口**：为什么是现在？这个窗口期大概多长？
-
----
-
-### 二、产业链分析 🔗
-
-**产业链位置图**：
-上游：[具体举例2-3个企业或类型]
-↓
-中游：[具体举例2-3个企业或类型]
-↓
-下游：[具体举例2-3个企业或类型]
-
-**最适合切入的环节**：
-- **推荐环节**：XXX（明确说是上游/中游/下游的哪个具体位置）
-- **理由**：为什么这个环节最适合中小投资者/创业者（3-4点）
-- **资金门槛**：XX-XX万（给出范围）
-- **技术门槛**：高/中/低，具体需要什么技术或能力
-- **竞争程度**：高/中/低，说明现有玩家数量和竞争格局
-- **盈利周期**：多久可以实现盈亏平衡
-
----
-
-### 三、具体机会（3个） 💡
-
-#### 机会1：[机会名称 - 6-10个字]
-
-**机会描述**：（50-80字，说清楚具体做什么产品/服务）
-
-**为什么可行**：
-- **数据支撑1**：（从上面的新闻或政策中引用具体内容）
-- **数据支撑2**：（继续引用）
-- **数据支撑3**：（继续引用）
-
-**需要的资源/能力**：
-- **资金**：XX-XX万
-  - 产品开发：XX万
-  - 初期运营：XX万
-  - 市场推广：XX万
-- **团队**：X-X人
-  - [角色1]：XX人（需要什么能力）
-  - [角色2]：XX人（需要什么能力）
-- **技术**：
-  - [技术1]
-  - [技术2]
-- **其他关键资源**：
-  - 渠道、牌照、场地等
-
-**3个月MVP路线图**：
-- **第1个月**：
-  - 做什么（具体任务）
-  - 预期产出（具体成果）
-  
-- **第2个月**：
-  - 做什么
-  - 预期产出
-  
-- **第3个月**：
-  - 做什么
-  - 关键里程碑（如首批用户数、收入等）
-
-**成功案例参考**：（如果上面新闻中有相关案例，列举1-2个；没有就说"该细分领域尚处早期，可参考XXX类似模式"）
-
----
-
-#### 机会2：[机会名称]
-
-（完全按照机会1的结构，但内容要完全不同，从不同角度切入）
-
----
-
-#### 机会3：[机会名称]
-
-（完全按照机会1的结构，但内容要完全不同）
-
----
-
-### 四、风险提示 ⚠️
-
-用表格形式列出：
-
-| 风险类型 | 具体风险描述 | 应对建议 |
-|---------|-------------|---------|
-| **政策风险** | [具体说明可能的政策变化] | [给出2-3条具体建议] |
-| **市场风险** | [具体说明市场可能的变化] | [给出2-3条具体建议] |
-| **竞争风险** | [具体说明竞争对手威胁] | [给出2-3条具体建议] |
-| **技术风险** | [具体说明技术不确定性] | [给出2-3条具体建议] |
-| **资金风险** | [具体说明资金链风险] | [给出2-3条具体建议] |
-
----
-
-### 五、行动建议 ✅
-
-**如果你打算立即行动，推荐按以下步骤进行**：
-
-**第一步（本周内）**：
-- [ ] [具体行动1]
-- [ ] [具体行动2]
-- [ ] [具体行动3]
-- **预期结果**：[明确的成果]
-
-**第二步（本月内）**：
-- [ ] [具体行动1]
-- [ ] [具体行动2]
-- [ ] [具体行动3]
-- **预期结果**：[明确的成果]
-
-**第三步（3个月内）**：
-- [ ] [具体行动1]
-- [ ] [具体行动2]
-- [ ] [具体行动3]
-- **预期结果**：[明确的成果，如用户数、收入等]
-
-**关键决策指标**：
-- 如果[指标1]低于[数值]，则[调整建议]
-- 如果[指标2]低于[数值]，则[调整建议]
-- 如果[指标3]达到[数值]，则[下一步行动]
-
----
-
-### 六、补充信息 📚
-
-**本分析基于**：
-- 政策信号来源：新闻联播
-- 权威资讯：{len(data['recent_news'])} 条（新华社、人民网等）
-- 政策文件：{len(data['related_policies'])} 条（中国政府网）
-- 搜索关键词：{', '.join(data['search_queries'][:3])}
-
----
-
-## ✍️ 写作要求
-
-**必须做到**：
-1. **数据驱动**：每个判断都必须引用上面的新闻、政策或给出清晰逻辑
-2. **具体可执行**：避免"加强布局""深化合作"等空话，给出可操作的具体动作
-3. **风险透明**：客观指出所有潜在问题，不能只说好处
-4. **适合小团队**：所有建议都要考虑资金≤500万的实际约束
-5. **时效性强**：强调当前时间窗口，给出紧迫感
-
-**禁止**：
-- 不要编造数据或案例
-- 不要使用模糊表述（如"可能""或许"太多）
-- 不要给出无法验证的建议
-- 不要忽视风险只说机会
-
-现在开始生成详细的分析报告。
-"""
+要求：
+- 简明扼要，150字以内
+- 突出实操性
+- 不要重复已有信息"""
         
         return prompt
     
-    def _format_news_for_prompt(self, news_list):
-        """格式化新闻列表供LLM分析"""
-        if not news_list:
-            return "（暂无相关资讯）"
+    def _generate_action_suggestions(self, direction):
+        """生成行动建议"""
+        name = direction.get('name', '')
+        urgency = direction.get('urgency', '中')
+        threshold = direction.get('investment_threshold', '')
+        keywords = direction.get('keywords', [])
         
-        formatted = []
-        for i, news in enumerate(news_list[:8], 1):  # 最多8条
-            title = news.get('title', '无标题')
-            source = news.get('source', '未知来源')
-            snippet = news.get('snippet', '')
-            pub_time = news.get('pub_time', '未知时间')
-            
-            formatted.append(
-                f"**[{i}] {source} | {pub_time}**\n"
-                f"标题：{title}\n"
-                f"摘要：{snippet[:200] if snippet else '无摘要'}..."
-            )
-        
-        return "\n\n".join(formatted)
-    
-    def _format_policies_for_prompt(self, policy_list):
-        """格式化政策列表供LLM分析"""
-        if not policy_list:
-            return "（暂无相关政策）"
-        
-        formatted = []
-        for i, policy in enumerate(policy_list[:5], 1):  # 最多5条
-            title = policy.get('title', '无标题')
-            dept = policy.get('department', '未知部门')
-            pub_time = policy.get('pub_time', '未知时间')
-            
-            formatted.append(
-                f"**[{i}] {title}**\n"
-                f"发文单位：{dept}\n"
-                f"发布时间：{pub_time}"
-            )
-        
-        return "\n\n".join(formatted)
-    
-    def _generate_fallback_analysis(self, direction, index):
-        """当LLM失败时的降级分析"""
-        return f"""## 方向{index}：{direction.get('name', '未知方向')}
-
-### 一、机会判断 ⭐
-
-**一句话结论**：基于政策信号"{direction.get('policy_signal', '')}"，该方向具有投资价值，建议深入研究。
-
-**核心逻辑**：
-{direction.get('reason', '暂无详细分析')}
-
----
-
-### 二、基础信息
-
-| 维度 | 评估 |
-|-----|------|
-| **置信度** | {direction.get('confidence', 0)}/10 |
-| **行业分类** | {direction.get('category', '未知')} |
-| **政策强度** | {direction.get('policy_strength', '未知')} |
-| **紧迫性** | {direction.get('urgency', '中')} |
-| **投资门槛** | {direction.get('investment_threshold', '未知')} |
-
----
-
-### 三、数据来源
-
-- **权威资讯**: {len(direction.get('recent_news', []))} 条
-- **政策文件**: {len(direction.get('related_policies', []))} 条
-- **关键词**: {', '.join(direction.get('keywords', []))}
-
----
-
-### 四、资讯摘要
+        suggestions = """**行动建议**：
 
 """
-        # 添加新闻标题
-        news_list = direction.get('recent_news', [])
-        if news_list:
-            for i, news in enumerate(news_list[:5], 1):
-                fallback += f"{i}. [{news.get('source', '未知')}] {news.get('title', '')}\n"
+        
+        # 根据紧迫性给出建议
+        if urgency == "高":
+            suggestions += "- ⏰ **立即行动**：该方向时效性强，建议尽快评估可行性\n"
+        elif urgency == "中":
+            suggestions += "- 📅 **近期布局**：建议在1-2周内完成市场调研\n"
         else:
-            fallback += "暂无相关资讯\n"
+            suggestions += "- 🔍 **持续关注**：可作为中长期储备方向\n"
         
-        fallback += "\n---\n\n"
-        fallback += "**注意**：由于AI分析服务暂时不可用，以上为基础信息汇总。建议结合资讯内容人工进一步研判。\n\n---\n"
+        # 投资门槛建议
+        suggestions += f"- 💰 **资金规划**：预估门槛 {threshold}，建议准备10-20%的风险预留\n"
         
-        return fallback
+        # 调研建议
+        suggestions += f"- 🔎 **深入调研**：重点搜索「{keywords[0] if keywords else name}」相关的成功案例与竞品\n"
+        
+        # 资源对接
+        suggestions += "- 🤝 **资源对接**：联系行业协会、地方招商部门了解扶持政策细则\n"
+        
+        return suggestions
     
-    def _generate_footer(self, data):
-        """生成报告尾部"""
-        metadata = data.get('_enrichment_metadata', {})
+    def _level_to_risk_score(self, level: str) -> float:
+        """将风险等级转换为评分"""
+        level_map = {
+            '极低': 1,
+            '低': 3,
+            '中': 5,
+            '高': 7,
+            '极高': 9
+        }
+        return level_map.get(level, 5)
+    
+    def _generate_risk_disclaimer(self):
+        """生成风险提示"""
+        return """## ⚠️ 风险提示
+
+**重要声明**：
+
+1. **投资有风险，入市需谨慎**：本报告仅供参考，不构成投资建议
+2. **政策解读**：政策分析基于公开信息，具体执行以当地细则为准
+3. **市场变化**：投资环境瞬息万变，建议持续跟踪最新动态
+4. **尽职调查**：投资前请进行充分的市场调研和风险评估
+5. **专业咨询**：重大投资决策建议咨询专业的法律和财务顾问
+
+**数据来源**：
+- 新闻联播官方内容
+- 新华社、人民网等权威媒体
+- 中国政府网政策文件
+
+**生成方式**：
+- AI辅助分析 + 人工审核
+- 数据采集时间：报告生成当日
+
+---
+
+*本报告由AI自动生成，仅供学习研究使用。*"""
+    
+    def _generate_appendix(self, data):
+        """生成附录"""
+        metadata = data.get('_metadata', {})
+        enrich_metadata = data.get('_enrichment_metadata', {})
         
-        footer = f"""---
+        appendix = f"""## 📎 附录
 
-## 📊 报告说明
+### 报告元数据
 
-### 数据来源
-本报告数据来自以下权威渠道：
-- **新闻联播**：政策信号提取（央视网）
-- **权威媒体**：{', '.join(metadata.get('sources_used', ['新华社', '人民网', '中国政府网']))}
-- **政策文件**：中国政府网政策文件库
+- **分析模型**: {metadata.get('model', '未知')}
+- **Token使用**: {metadata.get('tokens_used', 0)}
+- **分析时间**: {metadata.get('timestamp', '未知')}
+- **补充时间**: {enrich_metadata.get('timestamp', '未知')}
+- **总请求数**: {enrich_metadata.get('total_requests', 0)}
+- **安全模式**: {'已启用' if enrich_metadata.get('safe_mode') else '未启用'}
 
-### 生成方法
-1. **步骤1**：AI从新闻联播中自动提取投资方向
-2. **步骤2**：爬取权威来源补充行业资讯和政策文件
-3. **步骤3**：DeepSeek深度分析生成投资报告
-4. **质量保证**：所有数据源均为权威公开渠道
+### 关键词索引
 
-### 适用场景
-- ✅ 个人创业方向选择参考
-- ✅ 小团队项目立项依据
-- ✅ 投资人行业趋势研判
-- ✅ 政策学习和行业研究
-
-### 使用建议
-1. 本报告提供方向性参考，具体决策需结合自身情况
-2. 建议优先关注"置信度≥8且紧迫性高"的方向
-3. 每个机会都需要进一步尽调验证
-4. 风险提示部分必须认真阅读
-
-### 免责声明
-1. 本报告仅供研究学习使用，不构成任何投资建议
-2. 投资决策需独立判断，投资有风险，入市需谨慎
-3. 报告内容基于公开信息，时效性以实际情况为准
-4. 对因使用本报告而产生的任何后果，报告生成方不承担责任
-
----
-
-## 📅 报告元数据
-
-**报告生成时间**: {datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}  
-**数据爬取时间**: {metadata.get('timestamp', '未知')}  
-**总请求次数**: {metadata.get('total_requests', 0)} 次  
-**数据源数量**: {len(metadata.get('sources_used', []))} 个  
-**安全模式**: {'已启用' if metadata.get('safe_mode', True) else '未启用'}
-
----
-
-## 🔗 相关资源
-
-**如需更多信息**：
-- 新华社：https://www.news.cn
-- 人民网：http://www.people.com.cn
-- 中国政府网：http://www.gov.cn
-- 国家政务服务平台：https://www.gjzwfw.gov.cn
-
----
-
-**技术支持**: DeepSeek AI | **数据来源**: 多源权威渠道  
-**版本**: v1.0 | **更新频率**: 每日
-
----
-
-© 2024 投资机会分析系统 | Powered by AI Technology
 """
-        return footer
+        
+        # 收集所有关键词
+        all_keywords = set()
+        directions = data.get('directions', [])
+        for direction in directions:
+            keywords = direction.get('keywords', [])
+            all_keywords.update(keywords)
+        
+        if all_keywords:
+            appendix += "、".join(sorted(all_keywords))
+        else:
+            appendix += "*无*"
+        
+        return appendix
     
     def save_report(self, report_content, date_str):
-        """保存报告到文件"""
-        if not report_content:
-            print("❌ 没有报告内容可保存")
-            return
+        """
+        保存报告到文件
         
-        from utils.path_helper import get_output_paths
+        参数：
+            report_content: Markdown格式的报告内容
+            date_str: 日期字符串 YYYYMMDD
+        """
         paths = get_output_paths(self.config, date_str)
+        reports_dir = paths['reports_dir']
         
-        filename = os.path.join(paths['reports_dir'], f"report_{date_str}.md")
-        
-        with open(filename, 'w', encoding='utf-8') as f:
+        # 1. 保存Markdown
+        md_path = os.path.join(reports_dir, f"report_{date_str}.md")
+        with open(md_path, 'w', encoding='utf-8') as f:
             f.write(report_content)
+        print(f"✅ Markdown报告: {md_path}")
         
-        print(f"\n✅ 报告已保存到: {filename}")
+        # 2. 生成并保存HTML
+        if self.config.get('report.export_formats.html', True):
+            html_path = self._export_html(report_content, date_str, reports_dir)
+            if html_path:
+                print(f"✅ HTML报告: {html_path}")
         
-        # 统计信息
-        word_count = len(report_content)
-        line_count = report_content.count('\n')
-        section_count = report_content.count('##')
+        # 3. 生成并保存PDF
+        if self.config.get('report.export_formats.pdf', True):
+            pdf_path = self._export_pdf(report_content, date_str, reports_dir)
+            if pdf_path:
+                print(f"✅ PDF报告: {pdf_path}")
         
-        print(f"\n📈 报告统计:")
-        print(f"   字数: {word_count:,} 字符")
-        print(f"   行数: {line_count:,} 行")
-        print(f"   章节数: {section_count} 个")
-        
-        # 生成简化版摘要
-        self._save_summary(report_content, date_str)
-
-        # 优先尝试使用 xhtml2pdf（无系统库依赖）
-        self._export_pdf_simple(report_content, date_str)
-
-        # 兼容旧路径：如可用则尝试 WeasyPrint
-        self._maybe_save_pdf(report_content, date_str)
+        # 4. 生成并保存摘要
+        if self.config.get('report.export_formats.summary', True):
+            summary_path = self._generate_summary(report_content, date_str, reports_dir)
+            if summary_path:
+                print(f"✅ 摘要文件: {summary_path}")
     
-    def _save_summary(self, report_content, date_str):
-        """
-        生成并保存报告摘要（纯文本版）
-        """
+    def _export_html(self, markdown_content, date_str, output_dir):
+        """导出为HTML"""
         try:
-            # 提取标题和执行摘要
-            lines = report_content.split('\n')
-            summary_lines = []
-            in_summary = False
+            import markdown
             
-            for line in lines:
-                if '## 🎯 执行摘要' in line:
-                    in_summary = True
-                    summary_lines.append(line)
-                    continue
+            # Markdown转HTML
+            html_body = markdown.markdown(
+                markdown_content,
+                extensions=['tables', 'fenced_code', 'nl2br']
+            )
+            
+            # 添加样式（带完整的打印媒体查询）
+            html_template = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>投资机会分析报告 - {date_str}</title>
+    <style>
+        /* 屏幕显示样式 */
+        body {{
+            font-family: "Microsoft YaHei", "PingFang SC", "SimSun", "SimHei", 
+                         "STHeiti", "Noto Sans CJK SC", sans-serif;
+            line-height: 1.8;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }}
+        .container {{
+            background-color: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            font-size: 28px;
+        }}
+        h2 {{
+            color: #34495e;
+            margin-top: 30px;
+            border-left: 4px solid #3498db;
+            padding-left: 15px;
+            font-size: 22px;
+        }}
+        h3 {{
+            color: #555;
+            margin-top: 25px;
+            font-size: 18px;
+        }}
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }}
+        th, td {{
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }}
+        th {{
+            background-color: #3498db;
+            color: white;
+        }}
+        tr:nth-child(even) {{
+            background-color: #f9f9f9;
+        }}
+        blockquote {{
+            border-left: 4px solid #e74c3c;
+            padding-left: 15px;
+            margin: 15px 0;
+            color: #555;
+            background-color: #fef5f5;
+            padding: 10px 15px;
+        }}
+        code {{
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: "Consolas", "Courier New", monospace;
+        }}
+        a {{
+            color: #3498db;
+            text-decoration: none;
+            word-break: break-all;
+        }}
+        a:hover {{
+            text-decoration: underline;
+        }}
+        hr {{
+            border: none;
+            border-top: 2px solid #eee;
+            margin: 30px 0;
+        }}
+        ul, ol {{
+            margin: 10px 0;
+            padding-left: 25px;
+        }}
+        li {{
+            margin: 8px 0;
+        }}
+        img {{
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 20px auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 5px;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .footer {{
+            margin-top: 40px;
+            text-align: center;
+            color: #999;
+            font-size: 14px;
+        }}
+        
+        /* 打印样式优化 */
+        @media print {{
+            @page {{
+                size: A4;
+                margin: 2cm 1.5cm;
+            }}
+            
+            body {{
+                background-color: white;
+                padding: 0;
+                margin: 0;
+                font-size: 11pt;
+            }}
+            
+            .container {{
+                box-shadow: none;
+                border-radius: 0;
+                padding: 0;
+            }}
+            
+            /* 避免标题孤立 */
+            h1, h2, h3, h4, h5, h6 {{
+                page-break-after: avoid;
+                page-break-inside: avoid;
+            }}
+            
+            /* H1标题前强制分页 */
+            h1 {{
+                page-break-before: always;
+            }}
+            
+            /* 第一个H1不分页 */
+            h1:first-of-type {{
+                page-break-before: avoid;
+            }}
+            
+            /* 避免表格、图片、引用块跨页断裂 */
+            table, img, blockquote, pre {{
+                page-break-inside: avoid;
+            }}
+            
+            /* 优化表格打印 */
+            table {{
+                font-size: 10pt;
+            }}
+            
+            th {{
+                background-color: #3498db !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }}
+            
+            /* 链接显示URL */
+            a[href]:after {{
+                content: " (" attr(href) ")";
+                font-size: 9pt;
+                color: #666;
+            }}
+            
+            /* 移除页面装饰 */
+            .footer {{
+                page-break-before: avoid;
+                margin-top: 30px;
+                font-size: 10pt;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        {html_body}
+        <div class="footer">
+            <p>报告生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        </div>
+    </div>
+</body>
+</html>"""
+            
+            html_path = os.path.join(output_dir, f"report_{date_str}.html")
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_template)
+            
+            return html_path
+            
+        except ImportError:
+            print("   ⚠️  缺少 markdown 库，跳过HTML导出")
+            print("   提示：运行 pip install Markdown 安装")
+            return None
+        except Exception as e:
+            print(f"   ⚠️  HTML导出失败: {e}")
+            return None
+    
+    def _export_pdf(self, markdown_content, date_str, output_dir):
+        """导出为PDF - 优先使用WeasyPrint（中文支持最佳）"""
+        # 方案1：优先使用 WeasyPrint（推荐，完美支持中文）
+        pdf_path = self._export_pdf_weasyprint(markdown_content, date_str, output_dir)
+        if pdf_path:
+            return pdf_path
+        
+        # 方案2：尝试 xhtml2pdf（备选，中文支持有限）
+        pdf_path = self._export_pdf_xhtml2pdf(markdown_content, date_str, output_dir)
+        if pdf_path:
+            return pdf_path
+        
+        # 方案3：两者都失败，提示用户使用浏览器打印
+        print("   💡 PDF库未安装，建议使用以下方案：")
+        print("      1. [推荐] 安装 WeasyPrint: pip install weasyprint")
+        print('      2. 或使用浏览器打开HTML文件并"打印为PDF"')
+        html_path = os.path.join(output_dir, f"report_{date_str}.html")
+        print(f"      HTML文件: {html_path}")
+        return None
+    
+    def _export_pdf_weasyprint(self, markdown_content, date_str, output_dir):
+        """使用WeasyPrint导出PDF（推荐方案，完美支持中文）"""
+        try:
+            from weasyprint import HTML, CSS
+            import markdown
+            
+            # 转换Markdown为HTML
+            html_body = markdown.markdown(
+                markdown_content,
+                extensions=['tables', 'fenced_code', 'nl2br']
+            )
+            
+            # 优化的PDF样式（完整的中文字体支持 + 打印优化）
+            html_string = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>投资机会分析报告 - {date_str}</title>
+    <style>
+        /* 页面设置 */
+        @page {{
+            size: A4;
+            margin: 2cm 1.5cm;
+            
+            /* 页眉页脚 */
+            @top-center {{
+                content: "投资机会分析报告";
+                font-size: 9pt;
+                color: #999;
+            }}
+            @bottom-right {{
+                content: "第 " counter(page) " 页";
+                font-size: 9pt;
+                color: #999;
+            }}
+        }}
+        
+        /* 基础样式 */
+        body {{
+            font-family: "Microsoft YaHei", "PingFang SC", "SimSun", "SimHei", 
+                         "STHeiti", "Noto Sans CJK SC", sans-serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: #333;
+            text-align: justify;
+        }}
+        
+        /* 标题样式 */
+        h1 {{
+            color: #2c3e50;
+            font-size: 24pt;
+            font-weight: bold;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 8pt;
+            margin-top: 0;
+            page-break-after: avoid;
+        }}
+        
+        h2 {{
+            color: #34495e;
+            font-size: 18pt;
+            font-weight: bold;
+            margin-top: 24pt;
+            margin-bottom: 12pt;
+            border-left: 4px solid #3498db;
+            padding-left: 12pt;
+            page-break-after: avoid;
+        }}
+        
+        h3 {{
+            color: #555;
+            font-size: 14pt;
+            font-weight: bold;
+            margin-top: 18pt;
+            margin-bottom: 10pt;
+            page-break-after: avoid;
+        }}
+        
+        /* 段落 */
+        p {{
+            margin: 8pt 0;
+            text-indent: 0;
+        }}
+        
+        /* 表格样式 */
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 12pt 0;
+            font-size: 10pt;
+            page-break-inside: avoid;
+        }}
+        
+        th {{
+            background-color: #3498db;
+            color: white;
+            padding: 8pt 10pt;
+            text-align: left;
+            font-weight: bold;
+        }}
+        
+        td {{
+            border: 1px solid #ddd;
+            padding: 8pt 10pt;
+            text-align: left;
+        }}
+        
+        tr:nth-child(even) {{
+            background-color: #f9f9f9;
+        }}
+        
+        /* 引用块 */
+        blockquote {{
+            border-left: 4px solid #e74c3c;
+            background-color: #fef5f5;
+            padding: 10pt 15pt;
+            margin: 12pt 0;
+            font-style: italic;
+            color: #555;
+            page-break-inside: avoid;
+        }}
+        
+        /* 列表 */
+        ul, ol {{
+            margin: 8pt 0;
+            padding-left: 24pt;
+        }}
+        
+        li {{
+            margin: 6pt 0;
+            line-height: 1.5;
+        }}
+        
+        /* 链接 */
+        a {{
+            color: #3498db;
+            text-decoration: none;
+            word-break: break-all;
+        }}
+        
+        /* 分隔线 */
+        hr {{
+            border: none;
+            border-top: 2px solid #eee;
+            margin: 20pt 0;
+        }}
+        
+        /* 代码 */
+        code {{
+            background-color: #f4f4f4;
+            padding: 2pt 6pt;
+            border-radius: 3pt;
+            font-family: "Consolas", "Courier New", monospace;
+            font-size: 10pt;
+        }}
+        
+        /* 强调 */
+        strong {{
+            font-weight: bold;
+            color: #2c3e50;
+        }}
+        
+        em {{
+            font-style: italic;
+            color: #555;
+        }}
+        
+        /* 图片样式 */
+        img {{
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 15pt auto;
+            page-break-inside: avoid;
+            border: 1px solid #ddd;
+            border-radius: 4pt;
+            padding: 5pt;
+            background-color: white;
+        }}
+        
+        /* 避免孤立标题和列表项 */
+        h1, h2, h3, h4, h5, h6 {{
+            page-break-after: avoid;
+        }}
+        
+        /* 避免表格和块引用跨页断裂 */
+        table, blockquote, pre {{
+            page-break-inside: avoid;
+        }}
+    </style>
+</head>
+<body>
+    {html_body}
+</body>
+</html>"""
+            
+            # 使用WeasyPrint生成PDF，指定base_url让它能找到相对路径的图片
+            # base_url必须是绝对路径，且以file://开头
+            import os
+            from pathlib import Path
+            
+            # 转换为绝对路径
+            abs_output_dir = os.path.abspath(output_dir)
+            base_url = Path(abs_output_dir).as_uri() + '/'
+            pdf_path = os.path.join(output_dir, f"report_{date_str}.pdf")
+            
+            print(f"   📂 PDF生成目录: {output_dir}")
+            print(f"   🔗 Base URL: {base_url}")
+            
+            try:
+                HTML(string=html_string, base_url=base_url).write_pdf(pdf_path)
                 
+                # 验证PDF文件是否正常生成
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    return pdf_path
+                else:
+                    print(f"   ⚠️  PDF文件生成失败或文件为空")
+                    return None
+                    
+            except Exception as pdf_error:
+                print(f"   ⚠️  PDF生成出错: {pdf_error}")
+                import traceback
+                traceback.print_exc()
+                
+                # 删除空的或损坏的PDF文件
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+                return None
+            
+        except ImportError:
+            # WeasyPrint未安装
+            return None
+        except Exception as e:
+            print(f"   ⚠️  WeasyPrint导出失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _export_pdf_xhtml2pdf(self, markdown_content, date_str, output_dir):
+        """使用xhtml2pdf导出PDF（备选方案，中文支持有限）"""
+        try:
+            from xhtml2pdf import pisa
+            import markdown
+            
+            # 转换Markdown为HTML
+            html_body = markdown.markdown(
+                markdown_content,
+                extensions=['tables', 'fenced_code']
+            )
+            
+            # 获取字体配置
+            font_path = self.config.get('report.pdf_font_path', '')
+            font_face = ""
+            
+            # 如果配置了字体文件且存在，则使用
+            if font_path and os.path.exists(font_path):
+                font_face = f"""
+        @font-face {{
+            font-family: CustomFont;
+            src: url("{font_path}");
+        }}"""
+            
+            # xhtml2pdf的HTML模板（简化样式，避免不支持的CSS）
+            html_for_pdf = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <style>
+        {font_face}
+        
+        @page {{
+            size: A4;
+            margin: 2cm 1.5cm;
+        }}
+        
+        body {{
+            font-family: {'CustomFont,' if font_face else ''} "SimSun", "Microsoft YaHei", "SimHei", sans-serif;
+            line-height: 1.6;
+            font-size: 12pt;
+            color: #333;
+        }}
+        
+        h1 {{
+            color: #2c3e50;
+            font-size: 24pt;
+            margin-top: 0;
+        }}
+        
+        h2 {{
+            color: #34495e;
+            font-size: 18pt;
+            margin-top: 20pt;
+        }}
+        
+        h3 {{
+            color: #555;
+            font-size: 14pt;
+            margin-top: 16pt;
+        }}
+        
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            margin: 10pt 0;
+        }}
+        
+        th, td {{
+            border: 1px solid #ddd;
+            padding: 8pt;
+            text-align: left;
+        }}
+        
+        th {{
+            background-color: #3498db;
+            color: white;
+        }}
+        
+        blockquote {{
+            border-left: 3px solid #e74c3c;
+            padding-left: 10pt;
+            margin-left: 0;
+            color: #555;
+        }}
+        
+        ul, ol {{
+            margin: 8pt 0;
+            padding-left: 20pt;
+        }}
+        
+        li {{
+            margin: 5pt 0;
+        }}
+    </style>
+</head>
+<body>
+    {html_body}
+</body>
+</html>"""
+            
+            pdf_path = os.path.join(output_dir, f"report_{date_str}.pdf")
+            
+            with open(pdf_path, "wb") as pdf_file:
+                pisa_status = pisa.CreatePDF(
+                    html_for_pdf.encode('utf-8'),
+                    dest=pdf_file,
+                    encoding='utf-8'
+                )
+            
+            if pisa_status.err:
+                raise Exception("xhtml2pdf生成出现错误")
+            
+            print("   ⚠️  使用xhtml2pdf生成（中文显示可能不完整）")
+            return pdf_path
+            
+        except ImportError:
+            # xhtml2pdf未安装
+            return None
+        except Exception as e:
+            print(f"   ⚠️  xhtml2pdf导出失败: {e}")
+            return None
+    
+    def _generate_summary(self, report_content, date_str, output_dir):
+        """生成文字摘要"""
+        try:
+            # 提取关键信息生成摘要
+            lines = report_content.split('\n')
+            
+            summary_lines = []
+            summary_lines.append(f"投资机会分析报告摘要 - {date_str}")
+            summary_lines.append("=" * 60)
+            summary_lines.append("")
+            
+            # 提取执行摘要部分
+            in_summary = False
+            for line in lines:
+                if '## 📋 执行摘要' in line:
+                    in_summary = True
+                    continue
                 if in_summary:
-                    if line.startswith('## ') and '执行摘要' not in line:
+                    if line.startswith('## '):
                         break
-                    summary_lines.append(line)
+                    if line.strip() and not line.startswith('#'):
+                        summary_lines.append(line)
             
-            from utils.path_helper import get_output_paths
-            paths = get_output_paths(self.config, date_str)
-            summary_file = os.path.join(paths['reports_dir'], f"summary_{date_str}.txt")
-            with open(summary_file, 'w', encoding='utf-8') as f:
-                f.write(f"投资机会分析摘要 - {date_str}\n")
-                f.write("="*60 + "\n\n")
+            summary_lines.append("")
+            summary_lines.append("=" * 60)
+            summary_lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            summary_lines.append("")
+            summary_lines.append("详细报告请查看:")
+            summary_lines.append(f"- Markdown: report_{date_str}.md")
+            summary_lines.append(f"- HTML: report_{date_str}.html")
+            summary_lines.append(f"- PDF: report_{date_str}.pdf")
+            
+            summary_path = os.path.join(output_dir, f"summary_{date_str}.txt")
+            with open(summary_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(summary_lines))
-                f.write(f"\n\n{'='*60}\n")
-                f.write(f"完整报告请查看: report_{date_str}.md\n")
             
-            print(f"   摘要文件: summary_{date_str}.txt")
+            return summary_path
             
         except Exception as e:
             print(f"   ⚠️  摘要生成失败: {e}")
+            return None
 
-    def _export_pdf_simple(self, report_content, date_str):
-        """首选方案：使用 xhtml2pdf 将报告转为 PDF，避免系统依赖。"""
-        try:
-            if md is None:
-                return
-            if 'pisa' not in globals() or pisa is None:
-                return
-            # Markdown -> HTML
-            html_body = md.markdown(report_content, extensions=['extra'])
-            full_html = (
-                "<!doctype html><html><head><meta charset='utf-8'>"
-                "<style>"
-                "body{font-family:'NotoSansSC','Microsoft YaHei','SimSun','SimHei',Arial,Helvetica,sans-serif;line-height:1.6;font-size:14px;}"
-                "h1,h2,h3{margin:16px 0;}"
-                "code, pre {font-family:Consolas,'Courier New',monospace;}"
-                "table{border-collapse:collapse;width:100%;}"
-                "table,th,td{border:1px solid #ddd;padding:6px;}"
-                "blockquote{color:#555;border-left:4px solid #ddd;padding-left:10px;margin-left:0;}"
-                "</style></head><body>" + html_body + "</body></html>"
-            )
-            from utils.path_helper import get_output_paths
-            paths = get_output_paths(self.config, date_str)
-            pdf_path = os.path.join(paths['reports_dir'], f"report_{date_str}.pdf")
-            # Register project font if present (improves CJK rendering)
-            fonts_dir = os.path.join(os.getcwd(), 'fonts')
-            font_file = os.path.join(fonts_dir, 'NotoSansSC-Regular.ttf')
-            try:
-                if os.path.exists(font_file) and pdfmetrics is not None and TTFont is not None:
-                    pdfmetrics.registerFont(TTFont('NotoSansSC', font_file))
-            except Exception:
-                pass
-            with open(pdf_path, 'wb') as out:
-                result = pisa.CreatePDF(src=full_html, dest=out, encoding='utf-8')
-            if getattr(result, 'err', 0):
-                # 留给备用方案处理
-                return
-            print(f"   PDF文件: {pdf_path} (xhtml2pdf)")
-        except Exception:
-            # 不中断主流程
-            pass
 
-    def _maybe_save_pdf(self, report_content, date_str):
-        """尝试将 Markdown 报告转为 PDF（若依赖可用）。"""
-        try:
-            if md is None:
-                print("   ⚠️  未安装 Markdown 库（python-Markdown），跳过 PDF 生成")
-                return
-
-            # Markdown -> HTML
-            html_body = md.markdown(report_content, extensions=['extra'])
-            full_html = (
-                "<!doctype html><html><head><meta charset='utf-8'>"
-                "<style>"
-                "body{font-family:'Microsoft YaHei',Arial,Helvetica,sans-serif;line-height:1.6;font-size:14px;}"
-                "h1,h2,h3{margin:16px 0;}"
-                "code, pre {font-family:Consolas,'Courier New',monospace;}"
-                "table{border-collapse:collapse;width:100%;}"
-                "table,th,td{border:1px solid #ddd;padding:6px;}"
-                "blockquote{color:#555;border-left:4px solid #ddd;padding-left:10px;margin-left:0;}"
-                "</style></head><body>" + html_body + "</body></html>"
-            )
-
-            from utils.path_helper import get_output_paths
-            paths = get_output_paths(self.config, date_str)
-            html_path = os.path.join(paths['reports_dir'], f"report_{date_str}.html")
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(full_html)
-            print(f"   HTML文件: {html_path}")
-
-            # HTML -> PDF（可选 weasyprint）
-            if WEASY_HTML is None:
-                print("   ⚠️  未安装 WeasyPrint 或系统依赖，暂不生成 PDF。")
-                if WEASY_IMPORT_ERR:
-                    print(f"      具体原因：{WEASY_IMPORT_ERR}")
-                print("      可用浏览器打开 HTML 打印为 PDF，或安装 weasyprint/系统依赖后重试。")
-                return
-
-            try:
-                from utils.path_helper import get_output_paths
-                paths = get_output_paths(self.config, date_str)
-                pdf_path = os.path.join(paths['reports_dir'], f"report_{date_str}.pdf")
-                WEASY_HTML(string=full_html, base_url=os.getcwd()).write_pdf(pdf_path)
-                print(f"   PDF文件: {pdf_path}")
-            except Exception as e:
-                print(f"   ⚠️  PDF生成失败：{e}")
-                print("      可用浏览器打开 HTML 打印为 PDF，或安装 pandoc 进行转换。")
-        except Exception as e:
-            print(f"   ⚠️  Markdown→HTML 转换失败：{e}")
-
-def load_enriched_data(date_str):
-    """加载补充后的数据"""
-    from config import get_config
-    from utils.path_helper import get_output_paths
-    
-    config = get_config()
-    paths = get_output_paths(config, date_str)
-    filename = os.path.join(paths['data_dir'], f"enriched_{date_str}.json")
-    
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data
-    except FileNotFoundError:
-        print(f"❌ 未找到文件: {filename}")
-        print("   请先运行 main.py 完成前面的步骤")
-        return None
-    except Exception as e:
-        print(f"❌ 读取文件失败: {e}")
-        return None
+# ========== 测试函数 ==========
 
 def test_report_generator(date_str):
     """测试报告生成器"""
@@ -790,37 +1453,39 @@ def test_report_generator(date_str):
     print(f"🧪 测试报告生成器 - {date_str}")
     print("="*60)
     
-    # 加载数据
-    enriched_data = load_enriched_data(date_str)
+    # 加载补充后的数据
+    from utils.path_helper import get_output_paths
+    config = get_config()
+    paths = get_output_paths(config, date_str)
     
-    if not enriched_data:
+    enriched_file = os.path.join(paths['data_dir'], f"enriched_{date_str}.json")
+    
+    try:
+        with open(enriched_file, 'r', encoding='utf-8') as f:
+            enriched_data = json.load(f)
+    except FileNotFoundError:
+        print(f"❌ 未找到文件: {enriched_file}")
+        print("   请先运行完整流程生成补充数据")
+        return
+    except Exception as e:
+        print(f"❌ 读取文件失败: {e}")
         return
     
     # 初始化生成器
-    try:
-        generator = ReportGenerator(model="deepseek-chat")
-        
-        # 生成报告
-        report = generator.generate_full_report(enriched_data, date_str)
-        
-        if report:
-            # 保存报告
-            generator.save_report(report, date_str)
-            
-            print("\n✅ 测试完成！")
-            print(f"\n💡 查看报告:")
-            print(f"   完整版: report_{date_str}.md")
-            print(f"   摘要版: summary_{date_str}.txt")
-        else:
-            print("\n❌ 报告生成失败")
+    generator = ReportGenerator()
     
-    except Exception as e:
-        print(f"\n❌ 测试过程出错: {e}")
-        import traceback
-        traceback.print_exc()
+    # 生成报告
+    report = generator.generate_full_report(enriched_data, date_str)
+    
+    # 保存报告
+    generator.save_report(report, date_str)
+    
+    print("\n✅ 测试完成！")
+
 
 if __name__ == "__main__":
-    # 测试时使用今天的日期
+    # 测试
     from datetime import date
     today = date.today().strftime("%Y%m%d")
     test_report_generator(today)
+

@@ -57,16 +57,9 @@ class Config:
     
     def _apply_env_overrides(self):
         """应用环境变量覆盖"""
-        # LLM配置
-        if api_key := os.getenv("OPENAI_API_KEY"):
-            self._config.setdefault("llm", {})["api_key"] = api_key
-        
-        if base_url := os.getenv("OPENAI_BASE_URL"):
-            self._config.setdefault("llm", {})["base_url"] = base_url
-        
         if model := os.getenv("LLM_MODEL"):
             self._config.setdefault("llm", {})["model"] = model
-        
+
         # 日志级别
         if log_level := os.getenv("LOG_LEVEL"):
             self._config.setdefault("logging", {})["level"] = log_level.upper()
@@ -74,6 +67,23 @@ class Config:
         # 调试模式
         if debug := os.getenv("DEBUG"):
             self._config.setdefault("system", {})["debug"] = debug.lower() in ("true", "1", "yes")
+
+        models_section = self._config.setdefault("models", {})
+        providers = models_section.setdefault("providers", {})
+
+        if deepseek_key := os.getenv("DEEPSEEK_API_KEY"):
+            providers.setdefault("deepseek", {})["api_key"] = deepseek_key
+        if deepseek_base := os.getenv("DEEPSEEK_BASE_URL"):
+            providers.setdefault("deepseek", {})["base_url"] = deepseek_base
+        if deepseek_model := os.getenv("DEEPSEEK_MODEL"):
+            providers.setdefault("deepseek", {})["model"] = deepseek_model
+
+        if qwen_key := os.getenv("QWEN_API_KEY"):
+            providers.setdefault("qwen", {})["api_key"] = qwen_key
+        if qwen_base := os.getenv("QWEN_BASE_URL"):
+            providers.setdefault("qwen", {})["base_url"] = qwen_base
+        if qwen_model := os.getenv("QWEN_MODEL"):
+            providers.setdefault("qwen", {})["model"] = qwen_model
     
     def get(self, key: str, default: Any = None) -> Any:
         """
@@ -173,9 +183,10 @@ class Config:
         """
         errors = []
         
-        # 验证必需的API密钥
-        if not self.get("llm.api_key"):
-            errors.append("❌ 缺少必需的环境变量: OPENAI_API_KEY")
+        # 验证模型密钥（至少有一个可用提供方）
+        providers = self.get("models.providers", {}) or {}
+        if not any(cfg.get("api_key") for cfg in providers.values()):
+            errors.append("❌ 未配置任何可用的模型密钥 (models.providers.*.api_key)")
         
         # 验证路径
         paths = self.paths
